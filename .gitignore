@@ -28,3 +28,4 @@ junit_*.xml
 perf.data*
 **/*.rej
 **/*.orig
+.idea

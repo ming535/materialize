@@ -212,7 +212,7 @@ where
     }
 
     // Register session with adapter.
-    let (mut adapter_client, startup) =
+    let (mut session_client, startup) =
         match adapter_client.startup(session, frontegg.is_some()).await {
             Ok(startup) => startup,
             Err(e) => {
@@ -222,7 +222,7 @@ where
             }
         };
 
-    let session = adapter_client.session();
+    let session = session_client.session();
     let mut buf = vec![BackendMessage::AuthenticationOk];
     for var in session.vars().notify_set() {
         buf.push(BackendMessage::ParameterStatus(var.name(), var.value()));
@@ -240,7 +240,7 @@ where
 
     let machine = StateMachine {
         conn,
-        adapter_client: &mut adapter_client,
+        session_client: &mut session_client,
     };
 
     select! {
@@ -263,7 +263,7 @@ enum State {
 
 struct StateMachine<'a, A> {
     conn: &'a mut FramedConn<A>,
-    adapter_client: &'a mut mz_adapter::SessionClient,
+    session_client: &'a mut mz_adapter::SessionClient,
 }
 
 impl<'a, A> StateMachine<'a, A>
@@ -291,7 +291,7 @@ where
     async fn advance_ready(&mut self) -> Result<State, io::Error> {
         let message = self.conn.recv().await?;
 
-        self.adapter_client.reset_canceled();
+        self.session_client.reset_canceled();
 
         // NOTE(guswynn): we could consider adding spans to all message types. Currently
         // only a few message types seem useful.
@@ -380,7 +380,7 @@ where
         let param_types = vec![];
         const EMPTY_PORTAL: &str = "";
         if let Err(e) = self
-            .adapter_client
+            .session_client
             .declare(EMPTY_PORTAL.to_string(), stmt, param_types)
             .await
         {
@@ -390,7 +390,7 @@ where
         }
 
         let stmt_desc = self
-            .adapter_client
+            .session_client
             .session()
             .get_portal_unverified(EMPTY_PORTAL)
             .map(|portal| portal.desc.clone())
@@ -415,7 +415,7 @@ where
             }
         }
 
-        let result = match self.adapter_client.execute(EMPTY_PORTAL.to_string()).await {
+        let result = match self.session_client.execute(EMPTY_PORTAL.to_string()).await {
             Ok(response) => {
                 self.send_execute_response(
                     response,
@@ -435,7 +435,7 @@ where
         };
 
         // Destroy the portal.
-        self.adapter_client.session().remove_portal(EMPTY_PORTAL);
+        self.session_client.session().remove_portal(EMPTY_PORTAL);
 
         result
     }
@@ -443,7 +443,7 @@ where
     async fn start_transaction(&mut self, stmts: Option<usize>) {
         // start_transaction can't error (but assert that just in case it changes in
         // the future.
-        let res = self.adapter_client.start_transaction(stmts).await;
+        let res = self.session_client.start_transaction(stmts).await;
         assert!(res.is_ok());
     }
 
@@ -488,7 +488,7 @@ where
 
         // Implicit transactions are closed at the end of a Query message.
         {
-            if self.adapter_client.session().transaction().is_implicit() {
+            if self.session_client.session().transaction().is_implicit() {
                 self.commit_transaction().await?;
             }
         }
@@ -554,7 +554,7 @@ where
             return self.aborted_txn_error().await;
         }
         match self
-            .adapter_client
+            .session_client
             .describe(name, maybe_stmt, param_types)
             .await
         {
@@ -581,7 +581,7 @@ where
 
     /// End a transaction and report to the user if an error occurred.
     async fn end_transaction(&mut self, action: EndTransactionAction) -> Result<(), io::Error> {
-        let resp = self.adapter_client.end_transaction(action).await;
+        let resp = self.session_client.end_transaction(action).await;
         if let Err(err) = resp {
             self.send(BackendMessage::ErrorResponse(ErrorResponse::from_adapter(
                 Severity::Error,
@@ -605,7 +605,7 @@ where
 
         let aborted_txn = self.is_aborted_txn();
         let stmt = match self
-            .adapter_client
+            .session_client
             .get_prepared_statement(&statement_name)
             .await
         {
@@ -703,7 +703,7 @@ where
         let desc = stmt.desc().clone();
         let revision = stmt.catalog_revision;
         let stmt = stmt.sql().cloned();
-        if let Err(err) = self.adapter_client.session().set_portal(
+        if let Err(err) = self.session_client.session().set_portal(
             portal_name,
             desc,
             stmt,
@@ -733,7 +733,7 @@ where
 
             // Check if the portal has been started and can be continued.
             let portal = match self
-                .adapter_client
+                .session_client
                 .session()
                 .get_portal_unverified_mut(&portal_name)
             {
@@ -764,7 +764,7 @@ where
                     // Postgres).
                     self.start_transaction(Some(1)).await;
 
-                    match self.adapter_client.execute(portal_name.clone()).await {
+                    match self.session_client.execute(portal_name.clone()).await {
                         Ok(response) => {
                             self.send_execute_response(
                                 response,
@@ -826,7 +826,7 @@ where
         // Start a transaction if we aren't in one.
         self.start_transaction(Some(1)).await;
 
-        let stmt = match self.adapter_client.get_prepared_statement(&name).await {
+        let stmt = match self.session_client.get_prepared_statement(&name).await {
             Ok(stmt) => stmt,
             Err(err) => {
                 return self
@@ -855,7 +855,7 @@ where
         // Start a transaction if we aren't in one.
         self.start_transaction(Some(1)).await;
 
-        let session = self.adapter_client.session();
+        let session = self.session_client.session();
         let row_desc = session
             .get_portal_unverified(name)
             .map(|portal| describe_rows(&portal.desc, &portal.result_formats));
@@ -875,7 +875,7 @@ where
     }
 
     async fn close_statement(&mut self, name: String) -> Result<State, io::Error> {
-        self.adapter_client
+        self.session_client
             .session()
             .remove_prepared_statement(&name);
         self.send(BackendMessage::CloseComplete).await?;
@@ -883,14 +883,14 @@ where
     }
 
     async fn close_portal(&mut self, name: String) -> Result<State, io::Error> {
-        self.adapter_client.session().remove_portal(&name);
+        self.session_client.session().remove_portal(&name);
         self.send(BackendMessage::CloseComplete).await?;
         Ok(State::Ready)
     }
 
     fn complete_portal(&mut self, name: &str) {
         let portal = self
-            .adapter_client
+            .session_client
             .session()
             .get_portal_unverified_mut(name)
             .expect("portal should exist");
@@ -975,7 +975,7 @@ where
         match message {
             BackendMessage::ErrorResponse(ref err) => {
                 let minimum_client_severity =
-                    self.adapter_client.session().vars().client_min_messages();
+                    self.session_client.session().vars().client_min_messages();
                 if err
                     .severity
                     .should_output_to_client(minimum_client_severity)
@@ -1001,14 +1001,14 @@ where
 
     async fn sync(&mut self) -> Result<State, io::Error> {
         // Close the current transaction if we are in an implicit transaction.
-        if self.adapter_client.session().transaction().is_implicit() {
+        if self.session_client.session().transaction().is_implicit() {
             self.commit_transaction().await?;
         }
         return self.ready().await;
     }
 
     async fn ready(&mut self) -> Result<State, io::Error> {
-        let txn_state = self.adapter_client.session().transaction().into();
+        let txn_state = self.session_client.session().transaction().into();
         self.send(BackendMessage::ReadyForQuery(txn_state)).await?;
         self.flush().await
     }
@@ -1217,7 +1217,7 @@ where
                 // can't hold `var` across an await point.
                 let qn = name.to_string();
                 let msg = if let Some(var) = self
-                    .adapter_client
+                    .session_client
                     .session()
                     .vars_mut()
                     .notify_set()
@@ -1261,7 +1261,7 @@ where
                         SqlState::WARNING,
                         "streaming TAIL rows directly requires a client that does not buffer output",
                     );
-                    if self.adapter_client.session().vars().application_name() == "psql" {
+                    if self.session_client.session().vars().application_name() == "psql" {
                         msg.hint =
                             Some("Wrap your TAIL statement in `COPY (TAIL ...) TO STDOUT`.".into())
                     }
@@ -1363,7 +1363,7 @@ where
             &portal_name
         };
         let result_formats = self
-            .adapter_client
+            .session_client
             .session()
             .get_portal_unverified(result_format_portal_name)
             .expect("valid fetch portal name for send rows")
@@ -1399,7 +1399,7 @@ where
         loop {
             // Fetch next batch of rows, waiting for a possible requested timeout or
             // cancellation.
-            let batch = if self.adapter_client.canceled().now_or_never().is_some() {
+            let batch = if self.session_client.canceled().now_or_never().is_some() {
                 FetchResult::Canceled
             } else if rows.current.is_some() {
                 FetchResult::Rows(rows.current.take())
@@ -1408,7 +1408,7 @@ where
             } else {
                 tokio::select! {
                     _ = time::sleep_until(deadline.unwrap_or_else(time::Instant::now)), if deadline.is_some() => FetchResult::Rows(None),
-                    _ = self.adapter_client.canceled() => FetchResult::Canceled,
+                    _ = self.session_client.canceled() => FetchResult::Canceled,
                     batch = rows.remaining.recv() => match batch {
                         None => FetchResult::Rows(None),
                         Some(PeekResponseUnary::Rows(rows)) => FetchResult::Rows(Some(rows)),
@@ -1498,7 +1498,7 @@ where
         }
 
         let portal = self
-            .adapter_client
+            .session_client
             .session()
             .get_portal_unverified_mut(&portal_name)
             .expect("valid portal name for send rows");
@@ -1508,7 +1508,7 @@ where
         portal.state = PortalState::InProgress(Some(rows));
 
         let fetch_portal = fetch_portal_name.map(|name| {
-            self.adapter_client
+            self.session_client
                 .session()
                 .get_portal_unverified_mut(&name)
                 .expect("valid fetch portal")
@@ -1591,7 +1591,7 @@ where
                             .await;
                     }
                 },
-                _ = self.adapter_client.canceled() => {
+                _ = self.session_client.canceled() => {
                     return self
                         .error(ErrorResponse::error(
                             SqlState::QUERY_CANCELED,
@@ -1711,7 +1711,7 @@ where
 
             let count = rows.len();
 
-            if let Err(e) = self.adapter_client.insert_rows(id, columns, rows).await {
+            if let Err(e) = self.session_client.insert_rows(id, columns, rows).await {
                 return self
                     .error(ErrorResponse::from_adapter(Severity::Error, e))
                     .await;
@@ -1728,13 +1728,13 @@ where
         assert!(err.severity.is_error());
         debug!(
             "cid={} error code={} message={}",
-            self.adapter_client.session().conn_id(),
+            self.session_client.session().conn_id(),
             err.code.code(),
             err.message
         );
         let is_fatal = err.severity.is_fatal();
         self.send(BackendMessage::ErrorResponse(err)).await?;
-        let txn = self.adapter_client.session().transaction();
+        let txn = self.session_client.session().transaction();
         match txn {
             // Error can be called from describe and parse and so might not be in an active
             // transaction.
@@ -1749,7 +1749,7 @@ where
             }
             // Explicit transactions move to failed.
             TransactionStatus::InTransaction(_) => {
-                self.adapter_client.fail_transaction();
+                self.session_client.fail_transaction();
             }
         };
         if is_fatal {
@@ -1770,7 +1770,7 @@ where
 
     fn is_aborted_txn(&mut self) -> bool {
         matches!(
-            self.adapter_client.session().transaction(),
+            self.session_client.session().transaction(),
             TransactionStatus::Failed(_)
         )
     }
